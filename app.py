@@ -117,9 +117,34 @@ def _purge():
 
 threading.Thread(target=_purge, daemon=True).start()
 
+def _self_ping():
+    """
+    Render's free tier puts the service to sleep after ~15 minutes idle,
+    and waking it back up takes 20-50 seconds — during which a real phone
+    call would sit in silence or fail outright. This pings our own /health
+    endpoint every 10 minutes to keep the service awake. It is NOT a
+    substitute for Render's paid always-on plan if you get frequent calls,
+    but it removes the cold-start problem during normal usage gaps.
+    """
+    time.sleep(30)
+    while True:
+        try:
+            url = f"{os.environ.get('RENDER_EXTERNAL_URL', '')}/health"
+            if url.startswith("http"):
+                urllib.request.urlopen(url, timeout=10)
+        except Exception:
+            pass
+        time.sleep(600)
+
+threading.Thread(target=_self_ping, daemon=True).start()
+
 def cleanup_audio():
     now = time.time()
+    with _phrase_lock:
+        protected = set(_phrase_cache.values())
     for f in AUDIO_DIR.glob("*.mp3"):
+        if f.name in protected:
+            continue
         try:
             if now - f.stat().st_mtime > 600:
                 f.unlink()
@@ -274,7 +299,7 @@ def ask_ai(user_text, lang, history):
     payload = json.dumps({
         "model"      : "openai",        # GPT-4o via Pollinations, free
         "messages"   : messages,
-        "max_tokens" : 130,
+        "max_tokens" : 90,
         "temperature": 0.4,
         "seed"       : 42,
         "private"    : True,
@@ -290,7 +315,7 @@ def ask_ai(user_text, lang, history):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=9) as r:
+        with urllib.request.urlopen(req, timeout=6) as r:
             data  = json.loads(r.read())
             reply = data["choices"][0]["message"]["content"].strip()
             return _clean_reply(reply)
@@ -313,7 +338,7 @@ def _ask_ai_fallback(user_text, lang, history, system):
             headers={"Content-Type": "application/json"},
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=5) as r:
             data  = json.loads(r.read())
             reply = data.get("result", data.get("text", "")).strip()
             if reply:
@@ -374,6 +399,27 @@ def make_audio(text, lang):
         return None
 
 
+# Cache for fixed/repeated phrases (greeting, prompts, error lines, etc.)
+# so we don't pay the ~1-2s edge-tts generation cost on every single call —
+# only the AI's actual answer (which is always different) needs fresh TTS.
+_phrase_cache = {}
+_phrase_lock  = threading.Lock()
+
+def make_audio_cached(text, lang):
+    key = (lang, text)
+    with _phrase_lock:
+        cached = _phrase_cache.get(key)
+    if cached:
+        path = AUDIO_DIR / cached
+        if path.exists():
+            return f"{_host()}/static/audio/{cached}"
+    url = make_audio(text, lang)
+    if url:
+        with _phrase_lock:
+            _phrase_cache[key] = url.rsplit("/", 1)[-1]
+    return url
+
+
 # ════════════════════════════════════════════════════════════════════
 #  TWIML HELPERS
 # ════════════════════════════════════════════════════════════════════
@@ -402,23 +448,47 @@ def _media_tag(text, lang):
         return f"<Play>{url}</Play>"
     return _fallback_say(text, lang)
 
+def _media_tag_cached(text, lang):
+    """Same as _media_tag but reuses cached audio for fixed/repeated phrases."""
+    url = make_audio_cached(text, lang)
+    if url:
+        return f"<Play>{url}</Play>"
+    return _fallback_say(text, lang)
+
 def _speak_with_bargein(text, lang, action):
     """
     Speaks the reply WHILE listening for speech at the same time. If the
     caller starts talking mid-reply, Twilio cuts the audio instantly and
-    sends what they said to `action` — this is the interrupt behavior.
+    sends what they said to `action`.
+    IMPORTANT: bargeIn="true" is what actually enables the interrupt —
+    Twilio's <Gather> does NOT stop playing audio on speech by default,
+    this attribute is required.
     """
     tl    = LANGUAGES.get(lang, LANGUAGES[DEFAULT_LANG])[2]
     media = _media_tag(text, lang)
     return (
         f'  <Gather input="speech" action="{_host()}{action}" method="POST" '
-        f'speechTimeout="auto" timeout="7" language="{tl}">\n'
+        f'speechTimeout="auto" timeout="7" language="{tl}" bargeIn="true">\n'
         f'    {media}\n'
         f'  </Gather>'
     )
 
 def _speak_plain(text, lang):
     return f"  {_media_tag(text, lang)}"
+
+def _speak_plain_cached(text, lang):
+    return f"  {_media_tag_cached(text, lang)}"
+
+def _speak_with_bargein_cached(text, lang, action):
+    """Same as _speak_with_bargein but uses cached audio (for the fixed greeting)."""
+    tl    = LANGUAGES.get(lang, LANGUAGES[DEFAULT_LANG])[2]
+    media = _media_tag_cached(text, lang)
+    return (
+        f'  <Gather input="speech" action="{_host()}{action}" method="POST" '
+        f'speechTimeout="auto" timeout="7" language="{tl}" bargeIn="true">\n'
+        f'    {media}\n'
+        f'  </Gather>'
+    )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -440,7 +510,7 @@ def incoming_call():
             active_calls -= 1
         msg = (f"Abhi bahut saare log baat kar rahe hain. "
                f"Thodi der baad call karein ya hamare office number par call karein, {CONTACT}.")
-        return _xml(f"{_speak_plain(msg, 'hi')}\n  <Hangup/>")
+        return _xml(f"{_speak_plain_cached(msg, 'hi')}\n  <Hangup/>")
 
     greet = (
         "Namaste! Aap NSIM ke AI assistant se baat kar rahe hain. "
@@ -448,7 +518,7 @@ def incoming_call():
         "Hindi ya English mein poochhein, main madad karoonga."
     )
     return _xml(f"""
-{_speak_with_bargein(greet, "hi", "/answer")}
+{_speak_with_bargein_cached(greet, "hi", "/answer")}
   <Redirect method="POST">{_host()}/silent</Redirect>""")
 
 
@@ -522,14 +592,14 @@ def call_ended():
 def silent():
     msg = (f"Aapki awaaz nahi aayi. Kripya sawaal poochhein ya "
            f"hamare office number par call karein, {CONTACT}. Shukriya.")
-    return _xml(f"{_speak_plain(msg, 'hi')}\n  <Hangup/>")
+    return _xml(f"{_speak_plain_cached(msg, 'hi')}\n  <Hangup/>")
 
 
 @app.route("/bye", methods=["GET", "POST"])
 def bye():
     msg = ("Shukriya NSIM ko call karne ke liye. "
            "Koi bhi sawaal ho to dobaara zaroor call karein. Namaste.")
-    return _xml(f"{_speak_plain(msg, 'hi')}\n  <Hangup/>")
+    return _xml(f"{_speak_plain_cached(msg, 'hi')}\n  <Hangup/>")
 
 
 @app.route("/health")
